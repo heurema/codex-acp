@@ -21,7 +21,7 @@ use agent_client_protocol::{
         SessionNotification, SessionUpdate, StopReason, Terminal, TextContent,
         TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
         ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
-        UsageUpdate,
+        Usage, UsageUpdate,
     },
 };
 use codex_apply_patch::parse_patch;
@@ -66,7 +66,7 @@ use codex_protocol::{
         ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
         ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, StreamErrorEvent,
         TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent,
-        ThreadSettingsOverrides, TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent,
+        ThreadSettingsOverrides, TokenCountEvent, TokenUsage, TurnAbortedEvent, TurnCompleteEvent,
         TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
         WebSearchBeginEvent, WebSearchEndEvent,
     },
@@ -278,7 +278,7 @@ enum ThreadMessage {
     },
     Prompt {
         request: PromptRequest,
-        response_tx: oneshot::Sender<Result<oneshot::Receiver<Result<StopReason, Error>>, Error>>,
+        response_tx: oneshot::Sender<Result<oneshot::Receiver<Result<PromptResult, Error>>, Error>>,
     },
     SetMode {
         mode: SessionModeId,
@@ -305,6 +305,17 @@ enum ThreadMessage {
         request_key: String,
         response: Result<RequestPermissionResponse, Error>,
     },
+}
+
+pub struct PromptResult {
+    pub stop_reason: StopReason,
+    pub usage: Option<Usage>,
+}
+
+impl PromptResult {
+    fn new(stop_reason: StopReason, usage: Option<Usage>) -> Self {
+        Self { stop_reason, usage }
+    }
 }
 
 pub struct Thread {
@@ -370,7 +381,7 @@ impl Thread {
             .map_err(|e| Error::internal_error().data(e.to_string()))?
     }
 
-    pub async fn prompt(&self, request: PromptRequest) -> Result<StopReason, Error> {
+    pub async fn prompt(&self, request: PromptRequest) -> Result<PromptResult, Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
         let message = ThreadMessage::Prompt {
@@ -856,7 +867,9 @@ struct PromptState {
     pending_permission_interactions: HashMap<String, PendingPermissionInteraction>,
     next_permission_interaction_id: u64,
     event_count: usize,
-    response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
+    response_tx: Option<oneshot::Sender<Result<PromptResult, Error>>>,
+    turn_start_total_token_usage: Option<TokenUsage>,
+    latest_total_token_usage: Option<TokenUsage>,
     seen_message_deltas: bool,
     seen_reasoning_deltas: bool,
 }
@@ -866,7 +879,8 @@ impl PromptState {
         submission_id: String,
         thread: Arc<dyn CodexThreadImpl>,
         resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
-        response_tx: oneshot::Sender<Result<StopReason, Error>>,
+        response_tx: oneshot::Sender<Result<PromptResult, Error>>,
+        turn_start_total_token_usage: Option<TokenUsage>,
     ) -> Self {
         Self {
             submission_id,
@@ -880,6 +894,8 @@ impl PromptState {
             next_permission_interaction_id: 0,
             event_count: 0,
             response_tx: Some(response_tx),
+            turn_start_total_token_usage,
+            latest_total_token_usage: None,
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
         }
@@ -896,6 +912,41 @@ impl PromptState {
         // Keep detached permission request tasks running so ACP can route the
         // client's required `Cancelled` response after session cancellation.
         self.pending_permission_interactions.clear();
+    }
+
+    fn finish(&mut self, stop_reason: StopReason) {
+        self.detach_pending_interactions();
+        let usage = self.prompt_usage();
+        if let Some(response_tx) = self.response_tx.take() {
+            response_tx
+                .send(Ok(PromptResult::new(stop_reason, usage)))
+                .ok();
+        }
+    }
+
+    fn prompt_usage(&self) -> Option<Usage> {
+        let latest = self.latest_total_token_usage.as_ref()?;
+        let start = self.turn_start_total_token_usage.as_ref();
+
+        let delta = |latest: i64, start: Option<i64>| -> u64 {
+            latest.saturating_sub(start.unwrap_or_default()).max(0) as u64
+        };
+
+        Some(
+            Usage::new(
+                delta(latest.total_tokens, start.map(|usage| usage.total_tokens)),
+                delta(latest.input_tokens, start.map(|usage| usage.input_tokens)),
+                delta(latest.output_tokens, start.map(|usage| usage.output_tokens)),
+            )
+            .thought_tokens(delta(
+                latest.reasoning_output_tokens,
+                start.map(|usage| usage.reasoning_output_tokens),
+            ))
+            .cached_read_tokens(delta(
+                latest.cached_input_tokens,
+                start.map(|usage| usage.cached_input_tokens),
+            )),
+        )
     }
 
     fn spawn_permission_request(
@@ -1126,14 +1177,14 @@ impl PromptState {
                 info!("Task started with context window of {turn_id} {model_context_window:?} {collaboration_mode_kind:?}");
             }
             EventMsg::TokenCount(TokenCountEvent { info, .. }) => {
-                if let Some(info) = info
-                    && let Some(size) = info.model_context_window {
+                if let Some(info) = info {
+                    self.latest_total_token_usage = Some(info.total_token_usage.clone());
+                    if let Some(size) = info.model_context_window {
                         let used = info.last_token_usage.tokens_in_context_window().max(0) as u64;
-                        client.send_notification(SessionUpdate::UsageUpdate(UsageUpdate::new(
-                            used,
-                            size as u64,
-                        )));
+                        let update = UsageUpdate::new(used, size as u64);
+                        client.send_notification(SessionUpdate::UsageUpdate(update));
                     }
+                }
             }
             EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item , started_at_ms: _}) => {
                 info!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}");
@@ -1353,10 +1404,7 @@ impl PromptState {
                     "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
                     self.event_count
                 );
-                self.detach_pending_interactions();
-                if let Some(response_tx) = self.response_tx.take() {
-                    response_tx.send(Ok(StopReason::EndTurn)).ok();
-                }
+                self.finish(StopReason::EndTurn);
             }
             EventMsg::StreamError(StreamErrorEvent {
                 message,
@@ -1383,17 +1431,11 @@ impl PromptState {
             }
             EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id, completed_at: _, duration_ms: _ }) => {
                 info!("Turn {turn_id:?} aborted: {reason:?}");
-                self.detach_pending_interactions();
-                if let Some(response_tx) = self.response_tx.take() {
-                    response_tx.send(Ok(StopReason::Cancelled)).ok();
-                }
+                self.finish(StopReason::Cancelled);
             }
             EventMsg::ShutdownComplete => {
                 info!("Agent shutting down");
-                self.detach_pending_interactions();
-                if let Some(response_tx) = self.response_tx.take() {
-                    response_tx.send(Ok(StopReason::Cancelled)).ok();
-                }
+                self.finish(StopReason::Cancelled);
             }
             EventMsg::ViewImageToolCall(ViewImageToolCallEvent { call_id, path }) => {
                 info!("ViewImageToolCallEvent received");
@@ -2759,6 +2801,8 @@ struct ThreadActor<A> {
     resolution_rx: mpsc::UnboundedReceiver<ThreadMessage>,
     /// Last config options state we emitted to the client, used for deduping updates.
     last_sent_config_options: Option<Vec<SessionConfigOption>>,
+    /// Last cumulative token total observed for this thread, used as a per-prompt baseline.
+    latest_total_token_usage: Option<TokenUsage>,
 }
 
 impl<A: Auth> ThreadActor<A> {
@@ -2784,6 +2828,7 @@ impl<A: Auth> ThreadActor<A> {
             message_rx,
             resolution_rx,
             last_sent_config_options: None,
+            latest_total_token_usage: None,
         }
     }
 
@@ -3173,7 +3218,7 @@ impl<A: Auth> ThreadActor<A> {
     async fn handle_prompt(
         &mut self,
         request: PromptRequest,
-    ) -> Result<oneshot::Receiver<Result<StopReason, Error>>, Error> {
+    ) -> Result<oneshot::Receiver<Result<PromptResult, Error>>, Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
         let items = build_prompt_items(request.prompt);
@@ -3274,6 +3319,7 @@ impl<A: Auth> ThreadActor<A> {
             self.thread.clone(),
             self.resolution_tx.clone(),
             response_tx,
+            self.latest_total_token_usage.clone(),
         ));
 
         self.submissions.insert(submission_id, state);
@@ -3359,6 +3405,12 @@ impl<A: Auth> ThreadActor<A> {
         for item in history {
             match item {
                 RolloutItem::EventMsg(event_msg) => {
+                    if let EventMsg::TokenCount(TokenCountEvent {
+                        info: Some(info), ..
+                    }) = &event_msg
+                    {
+                        self.latest_total_token_usage = Some(info.total_token_usage.clone());
+                    }
                     self.replay_event_msg(&event_msg);
                 }
                 RolloutItem::ResponseItem(response_item) => {
@@ -3686,6 +3738,13 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_event(&mut self, Event { id, msg }: Event) {
+        if let EventMsg::TokenCount(TokenCountEvent {
+            info: Some(info), ..
+        }) = &msg
+        {
+            self.latest_total_token_usage = Some(info.total_token_usage.clone());
+        }
+
         if let Some(submission) = self.submissions.get_mut(&id) {
             submission.handle_event(&self.client, msg).await;
         } else {
@@ -4113,7 +4172,10 @@ mod tests {
     use agent_client_protocol::schema::{RequestPermissionResponse, TextContent};
     use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
     use codex_protocol::config_types::ModeKind;
-    use codex_protocol::{ThreadId, protocol::ThreadGoal};
+    use codex_protocol::{
+        ThreadId,
+        protocol::{ThreadGoal, TokenUsageInfo},
+    };
     use tokio::sync::{Mutex, Notify, mpsc::UnboundedSender};
 
     use super::*;
@@ -4128,8 +4190,9 @@ mod tests {
             response_tx: prompt_response_tx,
         })?;
 
-        let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
+        let prompt_result = prompt_response_rx.await??.await??;
+        assert_eq!(prompt_result.stop_reason, StopReason::EndTurn);
+        assert_eq!(prompt_result.usage, None);
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
@@ -4146,6 +4209,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_prompt_response_usage_is_current_prompt_delta() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, _handle) = setup().await?;
+
+        let (first_response_tx, first_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["token-usage".into()]),
+            response_tx: first_response_tx,
+        })?;
+        let first_result = first_response_rx.await??.await??;
+        let first_usage = first_result.usage.expect("usage should be returned");
+        assert_eq!(first_result.stop_reason, StopReason::EndTurn);
+        assert_eq!(first_usage.total_tokens, 100);
+        assert_eq!(first_usage.input_tokens, 60);
+        assert_eq!(first_usage.cached_read_tokens, Some(10));
+        assert_eq!(first_usage.output_tokens, 40);
+        assert_eq!(first_usage.thought_tokens, Some(5));
+        assert_eq!(first_usage.cached_write_tokens, None);
+
+        let (second_response_tx, second_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id, vec!["token-usage".into()]),
+            response_tx: second_response_tx,
+        })?;
+        let second_result = second_response_rx.await??.await??;
+        let second_usage = second_result.usage.expect("usage should be returned");
+        assert_eq!(second_result.stop_reason, StopReason::EndTurn);
+        assert_eq!(second_usage.total_tokens, 75);
+        assert_eq!(second_usage.input_tokens, 45);
+        assert_eq!(second_usage.cached_read_tokens, Some(15));
+        assert_eq!(second_usage.output_tokens, 30);
+        assert_eq!(second_usage.thought_tokens, Some(10));
+
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        let usage_updates = notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::UsageUpdate(update) => Some(update),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(usage_updates.len(), 2);
+        assert_eq!(usage_updates[0].size, 1000);
+        assert_eq!(usage_updates[0].used, 75);
+        assert_eq!(usage_updates[0].meta, None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_replayed_token_usage_seeds_first_prompt_delta() -> anyhow::Result<()> {
+        let (session_id, _, _, message_tx, _handle) = setup().await?;
+
+        let (replay_response_tx, replay_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::ReplayHistory {
+            history: vec![RolloutItem::EventMsg(EventMsg::TokenCount(
+                TokenCountEvent {
+                    info: Some(TokenUsageInfo {
+                        total_token_usage: token_usage(25, 15, 0, 10, 0),
+                        last_token_usage: token_usage(25, 15, 0, 10, 0),
+                        model_context_window: Some(1000),
+                    }),
+                    rate_limits: None,
+                },
+            ))],
+            response_tx: replay_response_tx,
+        })?;
+        replay_response_rx.await??;
+
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id, vec!["token-usage".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let prompt_result = prompt_response_rx.await??.await??;
+        let usage = prompt_result.usage.expect("usage should be returned");
+        assert_eq!(prompt_result.stop_reason, StopReason::EndTurn);
+        assert_eq!(usage.total_tokens, 75);
+        assert_eq!(usage.input_tokens, 45);
+        assert_eq!(usage.output_tokens, 30);
+        assert_eq!(usage.thought_tokens, Some(5));
+        assert_eq!(usage.cached_read_tokens, Some(10));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_thread_goal_updated_is_sent_as_agent_message() -> anyhow::Result<()> {
         let (session_id, client, _, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
@@ -4155,8 +4307,8 @@ mod tests {
             response_tx: prompt_response_tx,
         })?;
 
-        let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
+        let prompt_result = prompt_response_rx.await??.await??;
+        assert_eq!(prompt_result.stop_reason, StopReason::EndTurn);
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
@@ -4186,8 +4338,8 @@ mod tests {
             response_tx: prompt_response_tx,
         })?;
 
-        let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
+        let prompt_result = prompt_response_rx.await??.await??;
+        assert_eq!(prompt_result.stop_reason, StopReason::EndTurn);
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
@@ -4260,8 +4412,8 @@ mod tests {
             response_tx: prompt_response_tx,
         })?;
 
-        let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
+        let prompt_result = prompt_response_rx.await??.await??;
+        assert_eq!(prompt_result.stop_reason, StopReason::EndTurn);
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
@@ -4380,8 +4532,8 @@ mod tests {
             response_tx: prompt_response_tx,
         })?;
 
-        let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
+        let prompt_result = prompt_response_rx.await??.await??;
+        assert_eq!(prompt_result.stop_reason, StopReason::EndTurn);
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
@@ -4425,8 +4577,8 @@ mod tests {
             response_tx: prompt_response_tx,
         })?;
 
-        let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
+        let prompt_result = prompt_response_rx.await??.await??;
+        assert_eq!(prompt_result.stop_reason, StopReason::EndTurn);
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
@@ -4471,8 +4623,8 @@ mod tests {
             response_tx: prompt_response_tx,
         })?;
 
-        let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
+        let prompt_result = prompt_response_rx.await??.await??;
+        assert_eq!(prompt_result.stop_reason, StopReason::EndTurn);
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
@@ -4517,8 +4669,8 @@ mod tests {
             response_tx: prompt_response_tx,
         })?;
 
-        let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
+        let prompt_result = prompt_response_rx.await??.await??;
+        assert_eq!(prompt_result.stop_reason, StopReason::EndTurn);
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
@@ -4565,8 +4717,8 @@ mod tests {
             response_tx: prompt_response_tx,
         })?;
 
-        let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
+        let prompt_result = prompt_response_rx.await??.await??;
+        assert_eq!(prompt_result.stop_reason, StopReason::EndTurn);
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
@@ -4611,8 +4763,8 @@ mod tests {
             response_tx: prompt_response_tx,
         })?;
 
-        let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
+        let prompt_result = prompt_response_rx.await??.await??;
+        assert_eq!(prompt_result.stop_reason, StopReason::EndTurn);
         drop(message_tx);
 
         // We should only get ONE notification, not duplicates from both delta and non-delta
@@ -4667,6 +4819,22 @@ mod tests {
 
         let handle = tokio::spawn(actor.spawn());
         Ok((session_id, client, conversation, message_tx, handle))
+    }
+
+    fn token_usage(
+        total_tokens: i64,
+        input_tokens: i64,
+        cached_input_tokens: i64,
+        output_tokens: i64,
+        reasoning_output_tokens: i64,
+    ) -> TokenUsage {
+        TokenUsage {
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            reasoning_output_tokens,
+            total_tokens,
+        }
     }
 
     struct StubAuth;
@@ -4905,6 +5073,81 @@ mod tests {
                                     }),
                                 })
                                 .unwrap();
+                        } else if prompt == "approval-block-with-usage" {
+                            let turn_id = id.to_string();
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg: EventMsg::TokenCount(TokenCountEvent {
+                                        info: Some(TokenUsageInfo {
+                                            total_token_usage: token_usage(100, 60, 10, 40, 5),
+                                            last_token_usage: token_usage(100, 60, 10, 40, 5),
+                                            model_context_window: Some(1000),
+                                        }),
+                                        rate_limits: None,
+                                    }),
+                                })
+                                .unwrap();
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg: EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
+                                        call_id: "call-id".to_string(),
+                                        approval_id: Some("approval-id".to_string()),
+                                        turn_id,
+                                        started_at_ms: 0,
+                                        command: vec!["echo".to_string(), "hi".to_string()],
+                                        cwd: std::env::current_dir().unwrap().try_into().unwrap(),
+                                        reason: None,
+                                        network_approval_context: None,
+                                        proposed_execpolicy_amendment: None,
+                                        proposed_network_policy_amendments: None,
+                                        additional_permissions: None,
+                                        available_decisions: Some(vec![
+                                            ReviewDecision::Approved,
+                                            ReviewDecision::Abort,
+                                        ]),
+                                        parsed_cmd: vec![ParsedCommand::Unknown {
+                                            cmd: "echo hi".to_string(),
+                                        }],
+                                    }),
+                                })
+                                .unwrap();
+                        } else if prompt == "token-usage" {
+                            let turn_id = id.to_string();
+                            let total = token_usage(
+                                100 + (id as i64 * 75),
+                                60 + (id as i64 * 45),
+                                10 + (id as i64 * 15),
+                                40 + (id as i64 * 30),
+                                5 + (id as i64 * 10),
+                            );
+                            let last = token_usage(75, 45, 15, 30, 10);
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg: EventMsg::TokenCount(TokenCountEvent {
+                                        info: Some(TokenUsageInfo {
+                                            total_token_usage: total,
+                                            last_token_usage: last,
+                                            model_context_window: Some(1000),
+                                        }),
+                                        rate_limits: None,
+                                    }),
+                                })
+                                .unwrap();
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                                        last_agent_message: None,
+                                        turn_id,
+                                        completed_at: None,
+                                        duration_ms: None,
+                                        time_to_first_token_ms: None,
+                                    }),
+                                })
+                                .unwrap();
                         } else {
                             self.op_tx
                                 .send(Event {
@@ -5019,8 +5262,24 @@ mod tests {
                     Op::ExecApproval { .. }
                     | Op::ResolveElicitation { .. }
                     | Op::RequestPermissionsResponse { .. }
-                    | Op::PatchApproval { .. }
-                    | Op::Interrupt => {}
+                    | Op::PatchApproval { .. } => {}
+                    Op::Interrupt => {
+                        if let Some(active_prompt_id) = self.active_prompt_id.lock().unwrap().take()
+                        {
+                            self.op_tx
+                                .send(Event {
+                                    id: active_prompt_id.clone(),
+                                    msg: EventMsg::TurnAborted(TurnAbortedEvent {
+                                        turn_id: Some(active_prompt_id),
+                                        reason:
+                                            codex_protocol::protocol::TurnAbortReason::Interrupted,
+                                        completed_at: None,
+                                        duration_ms: None,
+                                    }),
+                                })
+                                .unwrap();
+                        }
+                    }
                     Op::Shutdown => {
                         if let Some(active_prompt_id) = self.active_prompt_id.lock().unwrap().take()
                         {
@@ -5133,8 +5392,8 @@ mod tests {
             response_tx: prompt_response_tx,
         })?;
 
-        let stop_reason = prompt_response_rx.await??.await??;
-        assert_eq!(stop_reason, StopReason::EndTurn);
+        let prompt_result = prompt_response_rx.await??.await??;
+        assert_eq!(prompt_result.stop_reason, StopReason::EndTurn);
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
@@ -5211,6 +5470,7 @@ mod tests {
             thread.clone(),
             message_tx,
             response_tx,
+            None,
         );
 
         prompt_state.exec_approval(
@@ -5293,6 +5553,7 @@ mod tests {
             thread.clone(),
             message_tx,
             response_tx,
+            None,
         );
 
         let request_id = format!("{MCP_TOOL_APPROVAL_REQUEST_ID_PREFIX}call-123");
@@ -5410,6 +5671,7 @@ mod tests {
             thread.clone(),
             message_tx,
             response_tx,
+            None,
         );
 
         prompt_state
@@ -5466,8 +5728,13 @@ mod tests {
         let thread = Arc::new(StubCodexThread::new());
         let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
         let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut prompt_state =
-            PromptState::new("submission-id".to_string(), thread, message_tx, response_tx);
+        let mut prompt_state = PromptState::new(
+            "submission-id".to_string(),
+            thread,
+            message_tx,
+            response_tx,
+            None,
+        );
 
         prompt_state
             .handle_event(
@@ -5543,6 +5810,7 @@ mod tests {
             thread.clone(),
             message_tx,
             response_tx,
+            None,
         );
 
         prompt_state
@@ -5616,6 +5884,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_thread_cancel_resolves_in_flight_prompt() -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let notify = Arc::new(Notify::new());
+        let client = Arc::new(StubClient::with_blocked_permission_requests(
+            vec![RequestPermissionResponse::new(
+                RequestPermissionOutcome::Cancelled,
+            )],
+            notify.clone(),
+        ));
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
+        let conversation = Arc::new(StubCodexThread::new());
+        let models_manager = Arc::new(StubModelsManager);
+        let config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+        let actor = ThreadActor::new(
+            StubAuth,
+            session_client,
+            conversation.clone(),
+            models_manager,
+            config,
+            message_rx,
+            resolution_tx,
+            resolution_rx,
+        );
+
+        let handle = tokio::spawn(actor.spawn());
+        let thread = Thread {
+            thread: conversation.clone(),
+            message_tx,
+            _handle: handle,
+        };
+
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+        thread.message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id, vec!["approval-block".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+        let prompt_result_rx = prompt_response_rx.await??;
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if !client.permission_requests.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+
+        tokio::time::timeout(Duration::from_millis(100), thread.cancel()).await??;
+        let prompt_result =
+            tokio::time::timeout(Duration::from_millis(100), prompt_result_rx).await???;
+        assert_eq!(prompt_result.stop_reason, StopReason::Cancelled);
+        assert_eq!(prompt_result.usage, None);
+        notify.notify_one();
+
+        let ops = conversation.ops.lock().unwrap();
+        assert!(matches!(ops.last(), Some(Op::Interrupt)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_thread_shutdown_bypasses_blocked_permission_request() -> anyhow::Result<()> {
         let session_id = SessionId::new("test");
         let notify = Arc::new(Notify::new());
@@ -5672,13 +6009,87 @@ mod tests {
         .await?;
 
         tokio::time::timeout(Duration::from_millis(100), thread.shutdown()).await??;
-        let stop_reason =
-            tokio::time::timeout(Duration::from_millis(100), stop_reason_rx).await??;
-        assert_eq!(stop_reason?, StopReason::Cancelled);
+        let prompt_result =
+            tokio::time::timeout(Duration::from_millis(100), stop_reason_rx).await???;
+        assert_eq!(prompt_result.stop_reason, StopReason::Cancelled);
+        assert_eq!(prompt_result.usage, None);
         notify.notify_one();
 
         let ops = conversation.ops.lock().unwrap();
         assert!(matches!(ops.last(), Some(Op::Shutdown)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_prompt_returns_cancelled_with_usage_when_available() -> anyhow::Result<()>
+    {
+        let session_id = SessionId::new("test");
+        let notify = Arc::new(Notify::new());
+        let client = Arc::new(StubClient::with_blocked_permission_requests(
+            vec![RequestPermissionResponse::new(
+                RequestPermissionOutcome::Cancelled,
+            )],
+            notify.clone(),
+        ));
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
+        let conversation = Arc::new(StubCodexThread::new());
+        let models_manager = Arc::new(StubModelsManager);
+        let config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+        let actor = ThreadActor::new(
+            StubAuth,
+            session_client,
+            conversation.clone(),
+            models_manager,
+            config,
+            message_rx,
+            resolution_tx,
+            resolution_rx,
+        );
+
+        let handle = tokio::spawn(actor.spawn());
+        let thread = Thread {
+            thread: conversation.clone(),
+            message_tx,
+            _handle: handle,
+        };
+
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+        thread.message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id, vec!["approval-block-with-usage".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+        let prompt_result_rx = prompt_response_rx.await??;
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if !client.permission_requests.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+
+        tokio::time::timeout(Duration::from_millis(100), thread.shutdown()).await??;
+        let prompt_result =
+            tokio::time::timeout(Duration::from_millis(100), prompt_result_rx).await???;
+        assert_eq!(prompt_result.stop_reason, StopReason::Cancelled);
+        assert_eq!(
+            prompt_result
+                .usage
+                .expect("usage should be returned")
+                .total_tokens,
+            100
+        );
+        notify.notify_one();
 
         Ok(())
     }

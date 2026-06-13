@@ -803,9 +803,9 @@ impl CodexAgent {
 
         // Get the session state
         let thread = self.get_thread(&request.session_id)?;
-        let stop_reason = thread.prompt(request).await?;
+        let prompt_result = thread.prompt(request).await?;
 
-        Ok(PromptResponse::new(stop_reason))
+        Ok(prompt_response_from_result(prompt_result))
     }
 
     async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
@@ -842,6 +842,10 @@ impl CodexAgent {
 
         Ok(SetSessionConfigOptionResponse::new(config_options))
     }
+}
+
+fn prompt_response_from_result(prompt_result: crate::thread::PromptResult) -> PromptResponse {
+    PromptResponse::new(prompt_result.stop_reason).usage(prompt_result.usage)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -946,7 +950,27 @@ fn stored_session_title(name: Option<&str>, preview: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use agent_client_protocol::schema::{StopReason, Usage};
+
     use super::*;
+    use crate::thread::PromptResult;
+
+    #[test]
+    fn prompt_response_from_result_preserves_usage() {
+        let prompt_result = PromptResult {
+            stop_reason: StopReason::EndTurn,
+            usage: Some(Usage::new(10, 6, 4).thought_tokens(2)),
+        };
+
+        let response = prompt_response_from_result(prompt_result);
+
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        let usage = response.usage.expect("usage should be preserved");
+        assert_eq!(usage.total_tokens, 10);
+        assert_eq!(usage.input_tokens, 6);
+        assert_eq!(usage.output_tokens, 4);
+        assert_eq!(usage.thought_tokens, Some(2));
+    }
 
     #[test]
     fn stored_session_title_prefers_thread_name() {
