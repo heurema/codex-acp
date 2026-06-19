@@ -227,31 +227,10 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Code sign macOS binary
-        if: startsWith(matrix.os, 'macos')
-        env:
-          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
-          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-          APPLE_NOTARIZATION_KEY: ${{ secrets.APPLE_NOTARIZATION_KEY }}
-          APPLE_NOTARIZATION_KEY_ID: ${{ secrets.APPLE_NOTARIZATION_KEY_ID }}
-          APPLE_NOTARIZATION_ISSUER_ID: ${{ secrets.APPLE_NOTARIZATION_ISSUER_ID }}
-        run: |
-          ./script/sign-mac target/${{ matrix.target }}/release/codex-acp
-
-      - name: Code sign Windows binary
-        if: startsWith(matrix.os, 'windows')
-        env:
-          AZURE_TENANT_ID: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_SIGNING_CLIENT_ID }}
-          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_SIGNING_CLIENT_SECRET }}
-          ACCOUNT_NAME: ${{ vars.AZURE_SIGNING_ACCOUNT_NAME }}
-          CERT_PROFILE_NAME: ${{ vars.AZURE_SIGNING_CERT_PROFILE_NAME }}
-          ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
-          FILE_DIGEST: SHA256
-          TIMESTAMP_DIGEST: SHA256
-          TIMESTAMP_SERVER: http://timestamp.acs.microsoft.com
-        run: |
-          .\script\sign-windows.ps1 target\${{ matrix.target }}\release\codex-acp.exe
+      # Code signing (macOS Apple notarization / Windows Azure) removed for the
+      # heurema alpha fork: we do not have the upstream signing certs. Binaries
+      # ship unsigned (macOS users may see a one-time Gatekeeper prompt). Re-add
+      # the upstream sign steps here if/when we provision our own certs.
 
       - name: Create archive
         id: create_archive
@@ -337,7 +316,8 @@ jobs:
     name: Publish NPM Platform Packages
     needs: [get-version, npm-packages]
     runs-on: ubuntu-latest
-    if: ${{ !github.event.repository.fork }}
+    # heurema fork: upstream gated publish on `!repository.fork`; our repo IS a
+    # GitHub fork, so that gate is removed to allow publishing under @heurema.
     environment: release # Optional: for enhanced security
     permissions:
       contents: read
@@ -359,12 +339,14 @@ jobs:
           path: npm-packages
 
       - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           for pkg in npm-packages/*; do
             if [ -d "$pkg" ]; then
               echo "Publishing $(basename $pkg)..."
               cd "$pkg"
-              npm publish
+              npm publish --access public
               cd ../..
             fi
           done
@@ -373,7 +355,7 @@ jobs:
     name: Publish NPM Base Package
     needs: [get-version, npm-packages, publish-npm-platform]
     runs-on: ubuntu-latest
-    if: ${{ !github.event.repository.fork }}
+    # heurema fork: fork-gate removed (see platform job note).
     environment: release # Optional: for enhanced security
     permissions:
       contents: read
@@ -400,9 +382,11 @@ jobs:
           sleep 30
 
       - name: Publish base package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           cd npm
-          npm publish
+          npm publish --access public
 
   create-release:
     name: Create Release
